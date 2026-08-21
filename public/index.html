@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="hi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="theme-color" content="#0f766e" />
+  <title>Shop Khata — Len Den</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div><div class="brand">Shop Khata</div><div class="sub">Len-Den Management · Hindi / English</div></div>
+    <div class="top-actions"><button class="ghost" id="langBtn">हिंदी</button><button class="wa-btn" id="waBtn">WhatsApp Connect</button></div>
+  </header>
+
+  <main class="container">
+    <section class="stats">
+      <div class="stat"><span id="sCustomers">0</span><small>Customers</small></div>
+      <div class="stat"><span id="sGiven">₹0</span><small>You Gave / Debit</small></div>
+      <div class="stat"><span id="sReceived">₹0</span><small>You Got / Credit</small></div>
+    </section>
+
+    <section class="toolbar"><div><h1>Khata</h1><p id="hint">Har customer ka poora len-den ek jagah.</p></div><button class="primary" id="addBtn">+ Add Customer</button></section>
+    <input id="search" class="search" placeholder="Search customer / mobile..." />
+    <div id="customers" class="customer-grid"></div>
+  </main>
+
+  <div id="modal" class="modal hidden"><div class="modal-card"><button class="close" data-close>×</button><div id="modalBody"></div></div></div>
+  <div id="toast" class="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
