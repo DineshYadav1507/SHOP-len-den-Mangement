@@ -1,32 +1,27 @@
 <!doctype html>
 <html lang="hi">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <meta name="theme-color" content="#0f766e" />
-  <title>Shop Khata — Len Den</title>
-  <link rel="stylesheet" href="/style.css" />
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0f766e"><meta name="description" content="Shop Khata - debit credit and WhatsApp ledger"><title>Shop Khata — Len Den</title>
+  <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <header class="topbar">
-    <div><div class="brand">Shop Khata</div><div class="sub">Len-Den Management · Hindi / English</div></div>
-    <div class="top-actions"><button class="ghost" id="langBtn">हिंदी</button><button class="wa-btn" id="waBtn">WhatsApp Connect</button></div>
-  </header>
-
-  <main class="container">
-    <section class="stats">
-      <div class="stat"><span id="sCustomers">0</span><small>Customers</small></div>
-      <div class="stat"><span id="sGiven">₹0</span><small>You Gave / Debit</small></div>
-      <div class="stat"><span id="sReceived">₹0</span><small>You Got / Credit</small></div>
-    </section>
-
-    <section class="toolbar"><div><h1>Khata</h1><p id="hint">Har customer ka poora len-den ek jagah.</p></div><button class="primary" id="addBtn">+ Add Customer</button></section>
-    <input id="search" class="search" placeholder="Search customer / mobile..." />
-    <div id="customers" class="customer-grid"></div>
-  </main>
-
-  <div id="modal" class="modal hidden"><div class="modal-card"><button class="close" data-close>×</button><div id="modalBody"></div></div></div>
-  <div id="toast" class="toast"></div>
+  <section id="authView" class="auth-page hidden">
+    <div class="auth-card"><div class="brand big">Shop Khata</div><p class="muted">Apna shop ka digital khata manage karein.</p>
+      <div class="tabs"><button id="loginTab" class="tab active">Login</button><button id="registerTab" class="tab">Create Shop</button></div>
+      <form id="loginForm"><label>Email<input name="email" type="email" required placeholder="you@example.com"></label><label>Password<input name="password" type="password" required placeholder="••••••••"></label><button class="primary full">Login</button></form>
+      <form id="registerForm" class="hidden"><label>Your Name<input name="name" required placeholder="Dinesh Yadav"></label><label>Shop Name<input name="shopName" required placeholder="Sharma General Store"></label><label>Email<input name="email" type="email" required placeholder="you@example.com"></label><label>Password<input name="password" type="password" minlength="8" required placeholder="Minimum 8 characters"></label><button class="primary full">Create Shop Account</button></form>
+    </div>
+  </section>
+  <section id="appView" class="hidden">
+    <header class="topbar"><div><div class="brand">Shop Khata</div><div id="shopTitle" class="sub">Len-Den Management · Hindi / English</div></div><div class="top-actions"><button class="ghost" id="langBtn">हिंदी</button><button class="ghost" id="logoutBtn">Logout</button><button class="wa-btn" id="waBtn">WhatsApp Connect</button></div></header>
+    <main class="container">
+      <section class="stats"><div class="stat"><span id="sCustomers">0</span><small>Customers</small></div><div class="stat"><span id="sGiven">₹0</span><small>You Gave / Debit</small></div><div class="stat"><span id="sReceived">₹0</span><small>You Got / Credit</small></div></section>
+      <section class="toolbar"><div><h1>Khata</h1><p id="hint">Har customer ka poora len-den ek jagah.</p></div><button class="primary" id="addBtn">+ Add Customer</button></section>
+      <input id="search" class="search" placeholder="Search customer / mobile...">
+      <div id="customers" class="customer-grid"></div>
+    </main>
+  </section>
+  <div id="modal" class="modal hidden"><div class="modal-card"><button class="close" data-close>×</button><div id="modalBody"></div></div></div><div id="toast" class="toast"></div>
   <script src="/app.js"></script>
 </body>
 </html>
