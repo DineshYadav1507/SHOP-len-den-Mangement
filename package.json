@@ -1,8 +1,8 @@
 {
   "name": "shop-len-den-management",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
-  "description": "Production-ready Hindi-English shop ledger with WhatsApp integration",
+  "description": "Production-ready Hindi-English shop ledger with reports, PDF statements, reminders and WhatsApp",
   "type": "module",
   "engines": { "node": ">=20" },
   "scripts": { "start": "node server.js", "dev": "node --watch server.js" },
@@ -16,6 +16,7 @@
     "express-rate-limit": "^7.5.0",
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
+    "pdfkit": "^0.19.1",
     "pino": "^9.7.0",
     "qrcode": "^1.5.4"
   }
