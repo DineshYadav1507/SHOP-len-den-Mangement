@@ -1,5 +1,10 @@
 import 'dotenv/config';
 import express from 'express';
+import cookieParser from 'cookie-parser';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 import Database from 'better-sqlite3';
 import QRCode from 'qrcode';
 import crypto from 'node:crypto';
@@ -11,30 +16,66 @@ import makeWASocket, { Browsers, DisconnectReason, useMultiFileAuthState } from 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const PUBLIC_URL = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+const IS_PROD = process.env.NODE_ENV === 'production';
 const dataDir = path.join(process.cwd(), 'data');
-fs.mkdirSync(dataDir, { recursive: true });
+const waDir = path.join(dataDir, 'whatsapp');
+fs.mkdirSync(waDir, { recursive: true });
 
 const db = new Database(path.join(dataDir, 'khata.db'));
 db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
 db.exec(`
-CREATE TABLE IF NOT EXISTS customers (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,phone TEXT NOT NULL,language TEXT NOT NULL DEFAULT 'hi',share_token TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS transactions (id INTEGER PRIMARY KEY AUTOINCREMENT,customer_id INTEGER NOT NULL,type TEXT NOT NULL CHECK(type IN ('DEBIT','CREDIT')),amount INTEGER NOT NULL CHECK(amount > 0),note TEXT DEFAULT '',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE CASCADE);
-CREATE TABLE IF NOT EXISTS whatsapp_messages (id INTEGER PRIMARY KEY AUTOINCREMENT,customer_id INTEGER,direction TEXT NOT NULL,message TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS shops (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,owner_name TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT,shop_id INTEGER NOT NULL,name TEXT NOT NULL,email TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(shop_id) REFERENCES shops(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS customers (id INTEGER PRIMARY KEY AUTOINCREMENT,shop_id INTEGER NOT NULL,name TEXT NOT NULL,phone TEXT NOT NULL,language TEXT NOT NULL DEFAULT 'hi',opening_balance INTEGER NOT NULL DEFAULT 0,share_token TEXT NOT NULL UNIQUE,archived INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(shop_id) REFERENCES shops(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS transactions (id INTEGER PRIMARY KEY AUTOINCREMENT,shop_id INTEGER NOT NULL,customer_id INTEGER NOT NULL,type TEXT NOT NULL CHECK(type IN ('DEBIT','CREDIT')),amount INTEGER NOT NULL CHECK(amount > 0),note TEXT DEFAULT '',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(shop_id) REFERENCES shops(id) ON DELETE CASCADE,FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS whatsapp_messages (id INTEGER PRIMARY KEY AUTOINCREMENT,shop_id INTEGER NOT NULL,customer_id INTEGER,direction TEXT NOT NULL,message TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',error TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(shop_id) REFERENCES shops(id) ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS idx_customers_shop ON customers(shop_id,archived,name);
+CREATE INDEX IF NOT EXISTS idx_transactions_customer ON transactions(shop_id,customer_id,created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_shop ON whatsapp_messages(shop_id,created_at);
 `);
-app.use(express.json());
-app.use(express.static(path.join(process.cwd(), 'public')));
 
-const wa = { sock: null, qr: null, connected: false, phone: null, connecting: false, error: null };
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(express.json({ limit: '100kb' }));
+app.use(cookieParser());
+app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: 'draft-8', legacyHeaders: false }));
+app.use(express.static(path.join(process.cwd(), 'public'), { maxAge: IS_PROD ? '1h' : 0 }));
+
 const logger = pino({ level: process.env.LOG_LEVEL || 'warn' });
-const authPath = path.join(dataDir, 'whatsapp-auth');
-const normalizePhone = phone => String(phone || '').replace(/\D/g, '');
-const balanceFor = customerId => db.prepare(`SELECT COALESCE(SUM(CASE WHEN type='DEBIT' THEN amount ELSE -amount END),0) balance FROM transactions WHERE customer_id=?`).get(customerId).balance;
-const customerView = row => ({ ...row, balance: balanceFor(row.id) });
-const makeShareToken = () => crypto.randomBytes(18).toString('hex');
+const normalizePhone = p => String(p || '').replace(/\D/g, '');
+const shareToken = () => crypto.randomBytes(24).toString('hex');
+const hashPassword = p => bcrypt.hash(p, 12);
+const sign = u => jwt.sign({ userId: u.id, shopId: u.shop_id }, JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES || '7d' });
+const cookieOptions = { httpOnly: true, sameSite: 'lax', secure: IS_PROD, maxAge: 7 * 24 * 60 * 60 * 1000, path: '/' };
 
-async function connectWhatsApp() {
+function auth(req, res, next) {
+  try {
+    const token = req.cookies.shop_session;
+    if (!token) return res.status(401).json({ error: 'Login required' });
+    const p = jwt.verify(token, JWT_SECRET);
+    const user = db.prepare('SELECT id,shop_id,name,email FROM users WHERE id=?').get(p.userId);
+    if (!user) return res.status(401).json({ error: 'Session expired' });
+    req.user = user; req.shopId = user.shop_id; next();
+  } catch { return res.status(401).json({ error: 'Session expired' }); }
+}
+function customerFor(shopId, id) { return db.prepare('SELECT * FROM customers WHERE shop_id=? AND id=? AND archived=0').get(shopId, id); }
+function balanceFor(shopId, customerId) {
+  const r = db.prepare(`SELECT COALESCE((SELECT opening_balance FROM customers WHERE id=? AND shop_id=?),0)+COALESCE(SUM(CASE WHEN type='DEBIT' THEN amount ELSE -amount END),0) balance FROM transactions WHERE customer_id=? AND shop_id=?`).get(customerId, shopId, customerId, shopId);
+  return Number(r?.balance || 0);
+}
+function customerView(c) { return { ...c, balance: balanceFor(c.shop_id, c.id) }; }
+
+const waSessions = new Map();
+function sessionFor(shopId) { if (!waSessions.has(shopId)) waSessions.set(shopId, { sock:null,qr:null,connected:false,connecting:false,phone:null,error:null }); return waSessions.get(shopId); }
+async function connectWhatsApp(shopId) {
+  const wa = sessionFor(shopId);
   if (wa.connecting || wa.connected) return;
   wa.connecting = true; wa.error = null;
+  const authPath = path.join(waDir, `shop-${shopId}`);
+  fs.mkdirSync(authPath, { recursive: true });
   try {
     const { state, saveCreds } = await useMultiFileAuthState(authPath);
     const sock = makeWASocket({ auth: state, browser: Browsers.ubuntu('Shop Khata'), logger });
@@ -42,30 +83,65 @@ async function connectWhatsApp() {
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
       if (qr) wa.qr = await QRCode.toDataURL(qr, { margin: 2, width: 320 });
-      if (connection === 'open') { wa.connected = true; wa.connecting = false; wa.qr = null; wa.error = null; wa.phone = sock.user?.id?.split(':')[0]?.split('@')[0] || null; }
-      if (connection === 'close') { wa.connected = false; wa.connecting = false; const code = lastDisconnect?.error?.output?.statusCode; if (code !== DisconnectReason.loggedOut) setTimeout(connectWhatsApp, 3000); else wa.error = 'WhatsApp logged out. Reconnect by scanning a new QR.'; }
+      if (connection === 'open') { wa.connected=true;wa.connecting=false;wa.qr=null;wa.error=null;wa.phone=sock.user?.id?.split(':')[0]?.split('@')[0] || null; }
+      if (connection === 'close') {
+        wa.connected=false;wa.connecting=false;
+        const code=lastDisconnect?.error?.output?.statusCode;
+        if (code !== DisconnectReason.loggedOut) setTimeout(() => connectWhatsApp(shopId), 4000);
+        else wa.error='WhatsApp logged out. Scan a new QR to reconnect.';
+      }
     });
-  } catch (e) { wa.connecting = false; wa.error = e.message; }
+  } catch (e) { wa.connecting=false;wa.error=e.message;logger.error(e); }
 }
-async function sendWhatsApp(phone, text) { if (!wa.connected || !wa.sock) throw new Error('WhatsApp is not connected'); const number = normalizePhone(phone); if (!number) throw new Error('Invalid phone number'); return wa.sock.sendMessage(`${number}@s.whatsapp.net`, { text }); }
-function transactionMessage(customer, tx, balance) {
-  const hindi = customer.language !== 'en';
-  const direction = tx.type === 'DEBIT' ? (hindi ? 'Aapke khate me udhaar diya / lena hai' : 'Amount added to your due balance') : (hindi ? 'Aapke khate me jama / dena hai' : 'Amount received / balance reduced');
-  const balanceText = balance >= 0 ? (hindi ? `Aapko dena hai: ₹${balance}` : `You need to pay: ₹${balance}`) : (hindi ? `Hume dena hai: ₹${Math.abs(balance)}` : `We need to pay: ₹${Math.abs(balance)}`);
-  const link = `${PUBLIC_URL}/khata/${customer.share_token}`;
-  return hindi ? `Namaste ${customer.name} ji,\n\n₹${tx.amount} ka len-den add hua.\n${direction}\n${tx.note ? `Note: ${tx.note}\n` : ''}\nCurrent balance: ${balanceText}\n\nKhata dekhein: ${link}\n\nDhanyavaad 🙏` : `Hello ${customer.name},\n\nA transaction of ₹${tx.amount} was added.\n${direction}\n${tx.note ? `Note: ${tx.note}\n` : ''}\nCurrent balance: ${balanceText}\n\nView khata: ${link}\n\nThank you.`;
+async function sendWhatsApp(shopId, phone, text) {
+  const wa=sessionFor(shopId);
+  if (!wa.connected || !wa.sock) throw new Error('WhatsApp is not connected');
+  const number=normalizePhone(phone);
+  if (number.length < 10) throw new Error('Invalid customer mobile number');
+  return wa.sock.sendMessage(`${number}@s.whatsapp.net`, { text });
 }
+function messageFor(customer, tx, balance) {
+  const hi=customer.language!=='en';
+  const direction=tx.type==='DEBIT' ? (hi?'Aapke khate me udhaar add hua hai.':'A credit/deue amount was added to your khata.') : (hi?'Payment jama hua hai.':'A payment was recorded.');
+  const due=balance>=0 ? (hi?`Aapko dena hai: ₹${balance}`:`Amount due: ₹${balance}`) : (hi?`Aapka advance: ₹${Math.abs(balance)}`:`Advance balance: ₹${Math.abs(balance)}`);
+  const link=`${PUBLIC_URL}/khata/${customer.share_token}`;
+  return hi ? `Namaste ${customer.name} ji 🙏\n\n₹${tx.amount.toLocaleString('en-IN')} ka len-den add hua.\n${direction}\n${tx.note?`Note: ${tx.note}\n`:''}\n${due}\n\nKhata dekhein:\n${link}\n\nDhanyavaad.` : `Hello ${customer.name},\n\n₹${tx.amount.toLocaleString('en-IN')} transaction recorded.\n${direction}\n${tx.note?`Note: ${tx.note}\n`:''}\n${due}\n\nView your khata:\n${link}\n\nThank you.`;
+}
+function reminderFor(customer,balance) { const hi=customer.language!=='en';const link=`${PUBLIC_URL}/khata/${customer.share_token}`;return hi?`Namaste ${customer.name} ji 🙏\nAapke khate me ₹${balance.toLocaleString('en-IN')} baki hai.\nKripya suvidha anusar payment kar dein.\n\nKhata: ${link}`:`Hello ${customer.name},\nYour current due balance is ₹${balance.toLocaleString('en-IN')}.\nPlease make the payment when convenient.\n\nKhata: ${link}`; }
 
-app.get('/api/dashboard', (_req,res)=>{ const customers=db.prepare('SELECT * FROM customers ORDER BY name COLLATE NOCASE').all().map(customerView); const totals=db.prepare(`SELECT COALESCE(SUM(CASE WHEN type='DEBIT' THEN amount ELSE 0 END),0) given,COALESCE(SUM(CASE WHEN type='CREDIT' THEN amount ELSE 0 END),0) received FROM transactions`).get(); res.json({customers,totals,whatsapp:{connected:wa.connected,connecting:wa.connecting,phone:wa.phone,hasQr:Boolean(wa.qr),error:wa.error}}); });
-app.get('/api/customers/:id',(req,res)=>{ const customer=db.prepare('SELECT * FROM customers WHERE id=?').get(req.params.id); if(!customer)return res.status(404).json({error:'Customer not found'}); const transactions=db.prepare('SELECT * FROM transactions WHERE customer_id=? ORDER BY id DESC').all(customer.id); res.json({customer:customerView(customer),transactions}); });
-app.post('/api/customers',(req,res)=>{ const name=String(req.body.name||'').trim(),phone=normalizePhone(req.body.phone),language=req.body.language==='en'?'en':'hi'; if(!name||phone.length<10)return res.status(400).json({error:'Name and valid mobile number are required'}); const result=db.prepare('INSERT INTO customers(name,phone,language,share_token) VALUES(?,?,?,?)').run(name,phone,language,makeShareToken()); res.json(customerView(db.prepare('SELECT * FROM customers WHERE id=?').get(result.lastInsertRowid))); });
-app.patch('/api/customers/:id',(req,res)=>{ const existing=db.prepare('SELECT * FROM customers WHERE id=?').get(req.params.id); if(!existing)return res.status(404).json({error:'Customer not found'}); const name=String(req.body.name??existing.name).trim(),phone=normalizePhone(req.body.phone??existing.phone),language=req.body.language==='en'?'en':(req.body.language==='hi'?'hi':existing.language); db.prepare('UPDATE customers SET name=?,phone=?,language=? WHERE id=?').run(name,phone,language,existing.id); res.json(customerView(db.prepare('SELECT * FROM customers WHERE id=?').get(existing.id))); });
-app.post('/api/customers/:id/transactions',async(req,res)=>{ const customer=db.prepare('SELECT * FROM customers WHERE id=?').get(req.params.id); if(!customer)return res.status(404).json({error:'Customer not found'}); const type=req.body.type==='CREDIT'?'CREDIT':'DEBIT',amount=Math.round(Number(req.body.amount)),note=String(req.body.note||'').trim().slice(0,300); if(!Number.isFinite(amount)||amount<=0)return res.status(400).json({error:'Enter a valid amount'}); const tx=db.prepare('INSERT INTO transactions(customer_id,type,amount,note) VALUES(?,?,?,?)').run(customer.id,type,amount,note),transaction=db.prepare('SELECT * FROM transactions WHERE id=?').get(tx.lastInsertRowid),balance=balanceFor(customer.id); let whatsapp={sent:false}; if(req.body.sendWhatsApp!==false){ const text=transactionMessage(customer,transaction,balance); try{await sendWhatsApp(customer.phone,text);db.prepare('INSERT INTO whatsapp_messages(customer_id,direction,message,status) VALUES(?,?,?,?)').run(customer.id,'outbound',text,'sent');whatsapp={sent:true};}catch(e){db.prepare('INSERT INTO whatsapp_messages(customer_id,direction,message,status) VALUES(?,?,?,?)').run(customer.id,'outbound',text,'failed');whatsapp={sent:false,error:e.message};} } res.json({transaction,balance,whatsapp}); });
-app.post('/api/customers/:id/send-reminder',async(req,res)=>{ const customer=db.prepare('SELECT * FROM customers WHERE id=?').get(req.params.id); if(!customer)return res.status(404).json({error:'Customer not found'}); const balance=balanceFor(customer.id); if(balance<=0)return res.status(400).json({error:'No amount is due from this customer'}); const hindi=customer.language!=='en',text=hindi?`Namaste ${customer.name} ji 🙏\nAapke khate me ₹${balance} baki hai.\nKripya suvidha anusar payment kar dein.\n\nKhata: ${PUBLIC_URL}/khata/${customer.share_token}`:`Hello ${customer.name},\nYour current due balance is ₹${balance}.\nPlease make the payment when convenient.\n\nKhata: ${PUBLIC_URL}/khata/${customer.share_token}`; try{await sendWhatsApp(customer.phone,text);db.prepare('INSERT INTO whatsapp_messages(customer_id,direction,message,status) VALUES(?,?,?,?)').run(customer.id,'outbound',text,'sent');res.json({sent:true});}catch(e){res.status(503).json({error:e.message});} });
-app.get('/api/whatsapp/status',(_req,res)=>res.json({connected:wa.connected,connecting:wa.connecting,phone:wa.phone,qr:wa.qr,error:wa.error}));
-app.post('/api/whatsapp/connect',(_req,res)=>{connectWhatsApp();res.json({ok:true});});
-app.post('/api/whatsapp/logout',async(_req,res)=>{try{if(wa.sock)await wa.sock.logout();}catch{} wa.connected=false;wa.phone=null;wa.qr=null;wa.error=null;res.json({ok:true});});
+app.get('/api/health', (_req,res)=>res.json({ok:true,service:'shop-khata',time:new Date().toISOString()}));
+app.get('/api/auth/me', auth, (req,res)=>res.json({user:req.user}));
+app.post('/api/auth/register', async (req,res)=>{
+  const {name,email,password,shopName}=req.body||{};
+  if(!name||!email||!password||!shopName||String(password).length<8)return res.status(400).json({error:'Name, shop name, email and 8+ character password are required'});
+  const normalized=String(email).trim().toLowerCase();
+  if(db.prepare('SELECT id FROM users WHERE email=?').get(normalized))return res.status(409).json({error:'Email already registered'});
+  const create=db.transaction(()=>{const s=db.prepare('INSERT INTO shops(name,owner_name) VALUES(?,?)').run(String(shopName).trim(),String(name).trim());const u=db.prepare('INSERT INTO users(shop_id,name,email,password_hash) VALUES(?,?,?,?)').run(s.lastInsertRowid,String(name).trim(),normalized,hashPassword);return {shopId:s.lastInsertRowid,userId:u.lastInsertRowid};});
+  try { const ids=create(); const user=db.prepare('SELECT id,shop_id,name,email FROM users WHERE id=?').get(ids.userId); res.cookie('shop_session',sign(user),cookieOptions).json({user}); } catch(e){res.status(500).json({error:'Unable to create account'});}
+});
+app.post('/api/auth/login', async (req,res)=>{const email=String(req.body?.email||'').trim().toLowerCase(),password=String(req.body?.password||'');const user=db.prepare('SELECT * FROM users WHERE email=?').get(email);if(!user||!(await bcrypt.compare(password,user.password_hash)))return res.status(401).json({error:'Invalid email or password'});res.cookie('shop_session',sign(user),cookieOptions).json({user:{id:user.id,shop_id:user.shop_id,name:user.name,email:user.email}});});
+app.post('/api/auth/logout',(_req,res)=>{res.clearCookie('shop_session',{...cookieOptions,maxAge:undefined});res.json({ok:true});});
 
-app.get('/khata/:token',(req,res)=>{ const customer=db.prepare('SELECT * FROM customers WHERE share_token=?').get(req.params.token); if(!customer)return res.status(404).send('Khata not found'); const transactions=db.prepare('SELECT * FROM transactions WHERE customer_id=? ORDER BY id DESC').all(customer.id),balance=balanceFor(customer.id); const rows=transactions.map(t=>`<tr><td>${new Date(t.created_at).toLocaleDateString('en-IN')}</td><td>${t.type}</td><td>₹${t.amount.toLocaleString('en-IN')}</td><td>${String(t.note||'').replace(/[<>]/g,'')}</td></tr>`).join(''); res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>${customer.name} - Khata</title><style>body{font-family:system-ui;margin:0;background:#f5f7fb;color:#172033}.card{max-width:760px;margin:30px auto;padding:24px;background:white;border-radius:20px;box-shadow:0 8px 30px #0001}h1{margin:0 0 6px}.bal{font-size:28px;font-weight:800;margin:20px 0}table{width:100%;border-collapse:collapse}td,th{padding:12px;border-bottom:1px solid #eee;text-align:left}@media(max-width:600px){.card{margin:0;border-radius:0;min-height:100vh}}</style></head><body><main class="card"><h1>${customer.name}</h1><div>Shop Khata</div><div class="bal">Balance: ₹${Math.abs(balance).toLocaleString('en-IN')} ${balance>=0?'Due / लेना है':'Advance / देना है'}</div><table><thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Note</th></tr></thead><tbody>${rows}</tbody></table></main></body></html>`); });
+app.get('/api/dashboard',auth,(req,res)=>{
+  const customers=db.prepare('SELECT * FROM customers WHERE shop_id=? AND archived=0 ORDER BY name COLLATE NOCASE').all(req.shopId).map(customerView);
+  const totals=db.prepare(`SELECT COALESCE(SUM(CASE WHEN type='DEBIT' THEN amount ELSE 0 END),0) given,COALESCE(SUM(CASE WHEN type='CREDIT' THEN amount ELSE 0 END),0) received,COUNT(*) transactions FROM transactions WHERE shop_id=?`).get(req.shopId);
+  const wa=sessionFor(req.shopId);
+  res.json({shop:db.prepare('SELECT id,name,owner_name FROM shops WHERE id=?').get(req.shopId),customers,totals,whatsapp:{connected:wa.connected,connecting:wa.connecting,phone:wa.phone,hasQr:Boolean(wa.qr),error:wa.error}});
+});
+app.get('/api/customers/:id',auth,(req,res)=>{const c=customerFor(req.shopId,req.params.id);if(!c)return res.status(404).json({error:'Customer not found'});const transactions=db.prepare('SELECT * FROM transactions WHERE shop_id=? AND customer_id=? ORDER BY id DESC').all(req.shopId,c.id);res.json({customer:customerView(c),transactions});});
+app.post('/api/customers',auth,(req,res)=>{const name=String(req.body?.name||'').trim(),phone=normalizePhone(req.body?.phone),language=req.body?.language==='en'?'en':'hi',opening=Math.round(Number(req.body?.openingBalance||0));if(!name||phone.length<10)return res.status(400).json({error:'Name and valid mobile number are required'});if(!Number.isFinite(opening))return res.status(400).json({error:'Invalid opening balance'});const result=db.prepare('INSERT INTO customers(shop_id,name,phone,language,opening_balance,share_token) VALUES(?,?,?,?,?,?)').run(req.shopId,name,phone,language,opening,shareToken());res.json(customerView(db.prepare('SELECT * FROM customers WHERE id=?').get(result.lastInsertRowid)));});
+app.patch('/api/customers/:id',auth,(req,res)=>{const c=customerFor(req.shopId,req.params.id);if(!c)return res.status(404).json({error:'Customer not found'});const name=String(req.body?.name??c.name).trim(),phone=normalizePhone(req.body?.phone??c.phone),language=req.body?.language==='en'?'en':(req.body?.language==='hi'?'hi':c.language);if(!name||phone.length<10)return res.status(400).json({error:'Invalid customer details'});db.prepare('UPDATE customers SET name=?,phone=?,language=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND shop_id=?').run(name,phone,language,c.id,req.shopId);res.json(customerView(db.prepare('SELECT * FROM customers WHERE id=?').get(c.id)));});
+app.delete('/api/customers/:id',auth,(req,res)=>{const c=customerFor(req.shopId,req.params.id);if(!c)return res.status(404).json({error:'Customer not found'});db.prepare('UPDATE customers SET archived=1,updated_at=CURRENT_TIMESTAMP WHERE id=? AND shop_id=?').run(c.id,req.shopId);res.json({ok:true});});
+app.post('/api/customers/:id/transactions',auth,async(req,res)=>{const c=customerFor(req.shopId,req.params.id);if(!c)return res.status(404).json({error:'Customer not found'});const type=req.body?.type==='CREDIT'?'CREDIT':'DEBIT',amount=Math.round(Number(req.body?.amount)),note=String(req.body?.note||'').trim().slice(0,500);if(!Number.isFinite(amount)||amount<=0)return res.status(400).json({error:'Enter a valid amount'});const tx=db.transaction(()=>{const r=db.prepare('INSERT INTO transactions(shop_id,customer_id,type,amount,note) VALUES(?,?,?,?,?)').run(req.shopId,c.id,type,amount,note);return db.prepare('SELECT * FROM transactions WHERE id=?').get(r.lastInsertRowid);})();const balance=balanceFor(req.shopId,c.id);let whatsapp={sent:false};if(req.body?.sendWhatsApp!==false){const text=messageFor(c,tx,balance);try{await sendWhatsApp(req.shopId,c.phone,text);db.prepare('INSERT INTO whatsapp_messages(shop_id,customer_id,direction,message,status) VALUES(?,?,?,?,?)').run(req.shopId,c.id,'outbound',text,'sent');whatsapp.sent=true;}catch(e){db.prepare('INSERT INTO whatsapp_messages(shop_id,customer_id,direction,message,status,error) VALUES(?,?,?,?,?,?)').run(req.shopId,c.id,'outbound',text,'failed',e.message);whatsapp.error=e.message;}}res.json({transaction:tx,balance,whatsapp});});
+app.delete('/api/transactions/:id',auth,(req,res)=>{const tx=db.prepare('SELECT * FROM transactions WHERE id=? AND shop_id=?').get(req.params.id,req.shopId);if(!tx)return res.status(404).json({error:'Transaction not found'});db.prepare('DELETE FROM transactions WHERE id=? AND shop_id=?').run(tx.id,req.shopId);res.json({ok:true,balance:balanceFor(req.shopId,tx.customer_id)});});
+app.post('/api/customers/:id/send-reminder',auth,async(req,res)=>{const c=customerFor(req.shopId,req.params.id);if(!c)return res.status(404).json({error:'Customer not found'});const balance=balanceFor(req.shopId,c.id);if(balance<=0)return res.status(400).json({error:'No amount is due from this customer'});const text=reminderFor(c,balance);try{await sendWhatsApp(req.shopId,c.phone,text);db.prepare('INSERT INTO whatsapp_messages(shop_id,customer_id,direction,message,status) VALUES(?,?,?,?,?)').run(req.shopId,c.id,'outbound',text,'sent');res.json({sent:true});}catch(e){res.status(503).json({error:e.message});}});
+app.get('/api/whatsapp/status',auth,(req,res)=>{const w=sessionFor(req.shopId);res.json({connected:w.connected,connecting:w.connecting,phone:w.phone,qr:w.qr,error:w.error});});
+app.post('/api/whatsapp/connect',auth,(req,res)=>{connectWhatsApp(req.shopId);res.json({ok:true});});
+app.post('/api/whatsapp/logout',auth,async(req,res)=>{const w=sessionFor(req.shopId);try{if(w.sock)await w.sock.logout();}catch{}w.connected=false;w.connecting=false;w.phone=null;w.qr=null;w.error=null;res.json({ok:true});});
+app.get('/api/messages',auth,(req,res)=>res.json({messages:db.prepare('SELECT * FROM whatsapp_messages WHERE shop_id=? ORDER BY id DESC LIMIT 100').all(req.shopId)}));
+
+app.get('/khata/:token',(req,res)=>{const c=db.prepare('SELECT * FROM customers WHERE share_token=? AND archived=0').get(req.params.token);if(!c)return res.status(404).send('Khata not found');const tx=db.prepare('SELECT * FROM transactions WHERE customer_id=? ORDER BY id DESC').all(c.id),balance=balanceFor(c.shop_id,c.id),safe=s=>String(s??'').replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));const rows=tx.map(t=>`<tr><td>${new Date(t.created_at).toLocaleDateString('en-IN')}</td><td>${t.type==='DEBIT'?'Debit / Lena':'Credit / Jama'}</td><td>₹${Number(t.amount).toLocaleString('en-IN')}</td><td>${safe(t.note)}</td></tr>`).join('');res.send(`<!doctype html><html lang="hi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${safe(c.name)} - Khata</title><style>body{font-family:system-ui;margin:0;background:#f4f7f8;color:#18212b}.card{max-width:800px;margin:30px auto;padding:28px;background:#fff;border-radius:22px;box-shadow:0 10px 40px #0001}.brand{color:#0f766e;font-weight:800}.bal{margin:22px 0;padding:22px;background:#edf8f5;border-radius:16px;font-size:30px;font-weight:850;color:#0f766e}table{width:100%;border-collapse:collapse}th,td{padding:12px;border-bottom:1px solid #edf0f2;text-align:left}small{color:#77808d}@media(max-width:600px){.card{margin:0;border-radius:0;min-height:100vh;padding:20px}table{font-size:13px}}</style></head><body><main class="card"><div class="brand">SHOP KHATA</div><h1>${safe(c.name)}</h1><small>Shared read-only statement</small><div class="bal">₹${Math.abs(balance).toLocaleString('en-IN')}<br><small>${balance>=0?'Lena hai / Amount Due':'Advance / Amount with shop'}</small></div><table><thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Note</th></tr></thead><tbody>${rows||'<tr><td colspan="4">No transactions</td></tr>'}</tbody></table></main></body></html>`);});
+
 app.use((_req,res)=>res.sendFile(path.join(process.cwd(),'public','index.html')));
-app.listen(PORT,()=>{console.log(`Shop Khata running on ${PORT}`);connectWhatsApp();});
+app.use((err,_req,res,_next)=>{logger.error(err);res.status(500).json({error:'Internal server error'});});
+app.listen(PORT,()=>logger.info(`Shop Khata running on ${PORT}`));
