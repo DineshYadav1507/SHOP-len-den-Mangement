@@ -1,5 +1,9 @@
 node_modules/
-data/
 .env
+.env.*
+!.env.example
+data/khata.db*
+data/backups/
+data/whatsapp/
 *.log
 .DS_Store
