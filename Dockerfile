@@ -11,6 +11,7 @@ COPY package*.json ./
 RUN npm install --omit=dev
 
 COPY . .
+RUN node docker/patch-whatsapp.mjs
 RUN mkdir -p /app/data /app/data/whatsapp /app/data/backups \
     && chown -R node:node /app
 
