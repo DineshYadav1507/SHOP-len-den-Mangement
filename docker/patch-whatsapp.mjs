@@ -3,6 +3,14 @@ import fs from 'node:fs';
 const file = '/app/server.js';
 let source = fs.readFileSync(file, 'utf8');
 
+// Repair the shop-profile migration quoting before Node loads server.js.
+// This is intentionally narrow and idempotent so existing application/WhatsApp code is preserved.
+const brokenMigration = "'ALTER TABLE shops ADD COLUMN phone TEXT DEFAULT ''',";
+const fixedMigration = '"ALTER TABLE shops ADD COLUMN phone TEXT DEFAULT \'\'",';
+if (source.includes(brokenMigration)) {
+  source = source.replace(brokenMigration, fixedMigration);
+}
+
 const oldSend = "async function sendWA(s,to,text){const w=wa(s);if(!w.connected||!w.sock)throw Error('WhatsApp is not connected');const n=phone(to);if(n.length<10)throw Error('Invalid mobile number');return w.sock.sendMessage(`${n}@s.whatsapp.net`,{text})}";
 
 const newSend = `async function resolveWAJid(sock, rawNumber){
