@@ -1,13 +1,13 @@
 services:
   shoplenden:
-    image: dineshyy/shoplenden:latest
+    image: ${SHOPLENDEN_IMAGE:-dineshyy/shoplenden:latest}
     container_name: shoplenden
     restart: unless-stopped
     init: true
     env_file:
       - .env
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:${SHOPLENDEN_PORT:-3000}:3000"
     volumes:
       - shoplenden_data:/app/data
     healthcheck:
