@@ -4,16 +4,55 @@ const file = '/app/server.js';
 let source = fs.readFileSync(file, 'utf8');
 
 // Repair the shop-profile migration quoting before Node loads server.js.
-// This is intentionally narrow and idempotent so existing application/WhatsApp code is preserved.
 const brokenMigration = "'ALTER TABLE shops ADD COLUMN phone TEXT DEFAULT ''',";
 const fixedMigration = '"ALTER TABLE shops ADD COLUMN phone TEXT DEFAULT \'\'",';
-if (source.includes(brokenMigration)) {
-  source = source.replace(brokenMigration, fixedMigration);
+if (source.includes(brokenMigration)) source = source.replace(brokenMigration, fixedMigration);
+
+// Some generated server.js versions contain the WhatsApp session map but lost
+// connectWA during earlier media patching. Restore the connector if necessary.
+if (!source.includes('async function connectWA(')) {
+  const anchor = "const waSessions=new Map();const wa=s=>{if(!waSessions.has(s))waSessions.set(s,{sock:null,qr:null,connected:false,connecting:false,phone:null,error:null});return waSessions.get(s)};";
+  if (!source.includes(anchor)) throw new Error('WhatsApp session map not found; refusing unsafe patch');
+  const connector = `\nasync function connectWA(s){
+  const w=wa(s);
+  if(w.connected||w.connecting) return;
+  w.connecting=true;
+  const dir=path.join(waDir,\`shop-${s}\`);
+  fs.mkdirSync(dir,{recursive:true});
+  try{
+    const {state,saveCreds}=await useMultiFileAuthState(dir);
+    const sock=makeWASocket({auth:state,browser:Browsers.ubuntu('Shop Khata'),logger:log});
+    w.sock=sock;
+    sock.ev.on('creds.update',saveCreds);
+    sock.ev.on('messages.upsert',async({messages,type})=>{
+      if(type!=='notify') return;
+      for(const message of messages||[]){
+        if(message?.key?.fromMe) continue;
+        const jid=message?.key?.remoteJid||'';
+        const text=message?.message?.conversation||message?.message?.extendedTextMessage?.text||message?.message?.imageMessage?.caption||message?.message?.videoMessage?.caption||'';
+        if(text) log.info({shopId:s,jid,text:text.slice(0,500)},'WhatsApp incoming message');
+      }
+    });
+    sock.ev.on('connection.update',async x=>{
+      if(x.qr) w.qr=await QRCode.toDataURL(x.qr,{width:320,margin:2});
+      if(x.connection==='open'){
+        w.connected=true;w.connecting=false;w.qr=null;w.error=null;
+        w.phone=sock.user?.id?.split(':')[0]?.split('@')[0]||null;
+        log.info({shopId:s,phone:w.phone},'WhatsApp connection open');
+      }
+      if(x.connection==='close'){
+        w.connected=false;w.connecting=false;
+        if(x.lastDisconnect?.error?.output?.statusCode!==DisconnectReason.loggedOut) setTimeout(()=>connectWA(s),4000);
+        else w.error='WhatsApp logged out; scan QR again';
+      }
+    });
+  }catch(e){w.connecting=false;w.error=e?.message||String(e);log.error({err:e,shopId:s},'WhatsApp connection failed');}
+}
+`;
+  source = source.replace(anchor,anchor+connector);
 }
 
-const oldSend = "async function sendWA(s,to,text){const w=wa(s);if(!w.connected||!w.sock)throw Error('WhatsApp is not connected');const n=phone(to);if(n.length<10)throw Error('Invalid mobile number');return w.sock.sendMessage(`${n}@s.whatsapp.net`,{text})}";
-
-const newSend = `async function resolveWAJid(sock, rawNumber){
+async function resolveWAJid(sock, rawNumber){
   const n=phone(rawNumber);
   if(n.length<10) throw Error('Invalid mobile number');
   try{
@@ -24,48 +63,21 @@ const newSend = `async function resolveWAJid(sock, rawNumber){
   return n+'@s.whatsapp.net';
 }
 
-async function sendWA(s,to,text){
+const oldSend = "async function sendWA(s,to,text){const w=wa(s);if(!w.connected||!w.sock)throw Error('WhatsApp is not connected');const n=phone(to);if(n.length<10)throw Error('Invalid mobile number');return w.sock.sendMessage(`${n}@s.whatsapp.net`,{text})}";
+const newSend = `async function sendWA(s,to,text){
   const w=wa(s);
   if(!w.connected||!w.sock) throw Error('WhatsApp is not connected');
   const jid=await resolveWAJid(w.sock,to);
-  log.info({shopId:s,jid},'Sending WhatsApp message');
-  try{
-    const result=await w.sock.sendMessage(jid,{text});
-    log.info({shopId:s,jid,messageId:result?.key?.id},'WhatsApp message accepted');
-    return result;
-  }catch(e){
-    w.error=e?.message||String(e);
-    log.error({err:e,shopId:s,jid},'WhatsApp send failed');
-    throw e;
-  }
+  try{return await w.sock.sendMessage(jid,{text});}
+  catch(e){w.error=e?.message||String(e);throw e;}
 }`;
+if(source.includes(oldSend)) source=source.replace(oldSend,newSend);
 
-if (!source.includes(oldSend)) {
-  throw new Error('Expected sendWA implementation was not found; refusing unsafe patch');
+const marker="sock.ev.on('creds.update',saveCreds);";
+if(!source.includes("sock.ev.on('messages.upsert'")){
+  const replacement=`${marker}\nsock.ev.on('messages.upsert',async({messages,type})=>{\n  if(type!=='notify') return;\n  for(const message of messages||[]){\n    if(message?.key?.fromMe) continue;\n    const jid=message?.key?.remoteJid||'';\n    const text=message?.message?.conversation||message?.message?.extendedTextMessage?.text||message?.message?.imageMessage?.caption||message?.message?.videoMessage?.caption||'';\n    if(text) log.info({shopId:s,jid,text:text.slice(0,500)},'WhatsApp incoming message');\n  }\n});`;
+  if(source.includes(marker)) source=source.replace(marker,replacement);
 }
-source = source.replace(oldSend,newSend);
-
-const marker = "sock.ev.on('creds.update',saveCreds);";
-const replacement = `${marker}
-sock.ev.on('messages.upsert',async({messages,type})=>{
-  if(type!=='notify') return;
-  for(const message of messages||[]){
-    if(message?.key?.fromMe) continue;
-    const jid=message?.key?.remoteJid||'';
-    const text=message?.message?.conversation||message?.message?.extendedTextMessage?.text||message?.message?.imageMessage?.caption||message?.message?.videoMessage?.caption||'';
-    if(!text) continue;
-    log.info({shopId:s,jid,text:text.slice(0,500)},'WhatsApp incoming message');
-  }
-});
-`;
-if (!source.includes("sock.ev.on('messages.upsert'")) {
-  if (!source.includes(marker)) throw new Error('Expected creds.update marker was not found; refusing unsafe patch');
-  source = source.replace(marker,replacement);
-}
-
-const oldOpen = "if(x.connection==='open'){w.connected=true;w.connecting=false;w.qr=null;w.error=null;w.phone=sock.user?.id?.split(':')[0]?.split('@')[0]||null}";
-const newOpen = "if(x.connection==='open'){w.connected=true;w.connecting=false;w.qr=null;w.error=null;w.phone=sock.user?.id?.split(':')[0]?.split('@')[0]||null;log.info({shopId:s,phone:w.phone},'WhatsApp connection open')}";
-if(source.includes(oldOpen)) source=source.replace(oldOpen,newOpen);
 
 fs.writeFileSync(file,source);
 console.log('WhatsApp Baileys patch applied successfully');
