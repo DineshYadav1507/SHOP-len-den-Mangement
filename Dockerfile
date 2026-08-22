@@ -11,9 +11,9 @@ COPY package*.json ./
 RUN npm install --omit=dev
 
 COPY . .
-# Repair the generated shop-profile migration before Node parses server.js.
-# The source currently contains SQL DEFAULT '' inside a single-quoted JS string.
-RUN sed -i "s/'ALTER TABLE shops ADD COLUMN phone TEXT DEFAULT ''',/\"ALTER TABLE shops ADD COLUMN phone TEXT DEFAULT ''\",/" server.js
+# The generated migration has an invalid JS quote at line 25.
+# Replace that whole line deterministically before Node parses server.js.
+RUN sed -i "25c\\  \"ALTER TABLE shops ADD COLUMN phone TEXT DEFAULT ''\"," server.js
 RUN node docker/patch-whatsapp.mjs
 RUN node scripts/apply-media-patch.mjs
 RUN mkdir -p /app/data /app/data/whatsapp /app/data/backups \
